@@ -33,7 +33,7 @@ without building their own system. Customers search, book, pay and get real-time
 
 - **API:** NestJS · TypeScript · Prisma · PostgreSQL · Redis · Swagger/OpenAPI · Jest
 - **Real-time:** Go · gorilla/websocket · worker pool · Redis pub/sub · Prometheus metrics
-- **Web:** Next.js 14 App Router (SSG / SSR / CSR per route) · TanStack Query · Zustand · Tailwind · PWA · Playwright
+- **Web:** Next.js 14 App Router (SSG / SSR / CSR per route) · TanStack Query · Zustand · Tailwind · lucide-react · PWA · Playwright
 - **Infra:** Docker · docker-compose · GitHub Actions · Kubernetes (manifests) · AWS-ready
 
 ## Architecture
@@ -70,7 +70,7 @@ Full write-ups: [docs/01-ARCHITECTURE.md](docs/01-ARCHITECTURE.md) · [docs/02-D
 | **Home** — SSG landing with featured vendors<br>![Home](screenshots/01-home.png) | **Browse vendors** — cursor-paginated search by city/name<br>![Browse](screenshots/02-vendors-search.png) |
 | **Vendor page** — services + live slot picker (WebSocket "Live" badge)<br>![Vendor](screenshots/03-vendor-page-slots.png) | **Booking confirmation** — idempotent create + payment intent<br>![Booking](screenshots/05-booking-flow.png) |
 | **Customer dashboard** — upcoming/past, cancel<br>![Customer](screenshots/06-customer-dashboard.png) | **Vendor dashboard** — incoming bookings, services, slot generator<br>![Vendor dashboard](screenshots/07-vendor-dashboard.png) |
-| **OpenAPI docs** — every route documented<br>![OpenAPI](screenshots/08-openapi-docs.png) | **Mobile / PWA** — responsive, installable<br>![Mobile](screenshots/09-mobile-vendor.png) |
+| **OpenAPI docs** — every route documented<br>![OpenAPI](screenshots/08-openapi-docs.png) | **Mobile / PWA** — responsive, installable<br>![Mobile](screenshots/09-mobile-vendor.png) ![Mobile home](screenshots/10-mobile-home.png) |
 
 ## Status & roadmap
 
