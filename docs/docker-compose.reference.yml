@@ -1,0 +1,90 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: booklk-postgres
+    environment:
+      POSTGRES_USER: booklk
+      POSTGRES_PASSWORD: booklk_dev
+      POSTGRES_DB: booklk
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U booklk"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: booklk-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # --- application services (built by their own Dockerfiles) ---
+  # Enable with:  docker compose --profile full up -d
+
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    container_name: booklk-api
+    profiles: ["full"]
+    environment:
+      DATABASE_URL: postgresql://booklk:booklk_dev@postgres:5432/booklk
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: dev_access_secret_change_me
+      JWT_REFRESH_SECRET: dev_refresh_secret_change_me
+      PAYMENT_WEBHOOK_SECRET: dev_webhook_secret_change_me
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  realtime:
+    build:
+      context: ./apps/realtime
+      dockerfile: Dockerfile
+    container_name: booklk-realtime
+    profiles: ["full"]
+    environment:
+      PORT: 8080
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: dev_access_secret_change_me
+      ALLOWED_ORIGINS: http://localhost:3001
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    container_name: booklk-web
+    profiles: ["full"]
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:3000/api
+      NEXT_PUBLIC_WS_URL: ws://localhost:8080/ws
+    ports:
+      - "3001:3000"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  redisdata:
