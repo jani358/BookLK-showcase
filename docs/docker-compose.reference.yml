@@ -1,10 +1,12 @@
+# Reference only. All credentials come from a local .env file (never committed);
+# `docker compose` reads it automatically. See .env.example in the private repo.
 services:
   postgres:
     image: postgres:16-alpine
     container_name: booklk-postgres
     environment:
       POSTGRES_USER: booklk
-      POSTGRES_PASSWORD: booklk_dev
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
       POSTGRES_DB: booklk
     ports:
       - "5432:5432"
@@ -40,11 +42,11 @@ services:
     container_name: booklk-api
     profiles: ["full"]
     environment:
-      DATABASE_URL: postgresql://booklk:booklk_dev@postgres:5432/booklk
+      DATABASE_URL: postgresql://booklk:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/booklk
       REDIS_URL: redis://redis:6379
-      JWT_SECRET: dev_access_secret_change_me
-      JWT_REFRESH_SECRET: dev_refresh_secret_change_me
-      PAYMENT_WEBHOOK_SECRET: dev_webhook_secret_change_me
+      JWT_SECRET: ${JWT_SECRET:?set in .env}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?set in .env}
+      PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:?set in .env}
       PORT: 3000
     ports:
       - "3000:3000"
@@ -63,7 +65,7 @@ services:
     environment:
       PORT: 8080
       REDIS_URL: redis://redis:6379
-      JWT_SECRET: dev_access_secret_change_me
+      JWT_SECRET: ${JWT_SECRET:?set in .env}
       ALLOWED_ORIGINS: http://localhost:3001
     ports:
       - "8080:8080"
