@@ -1,6 +1,6 @@
 # BookLK
 
-**Full source: [github.com/jani358/BookLK](https://github.com/jani358/BookLK)**
+**Full source is private. I can walk through it or share access with interviewers on request.**
 
 A multi-vendor booking marketplace for Sri Lanka. Salons, clinics, tutors and repair shops publish time
 slots, customers book and pay, vendors get paid out, and the platform keeps a commission.
@@ -74,7 +74,7 @@ connections it can hold.
 - k6 booking spike on k3d: **zero double bookings** at 200 users racing for 20 slots and at 500 for 50.
 - The booking latency target (p95 under 300 ms) **was not met**: about 3.2 s at 200 users and 6.0 s at
   500, on one laptop with the API pod CPU-bound. The
-  [load test report](https://github.com/jani358/BookLK/blob/main/docs/LOAD-TEST-REPORT.md) has what I'd
+  [load test report](docs/LOAD-TEST-REPORT.md) has what I'd
   try next.
 - Tests: 201 API unit, 65 API integration on real Postgres, Redis, Redpanda and Mongo, 39 for the
   webhooks service, 51 Go, 25 web unit, 6 Playwright, 11 Helm chart, and 34 `terraform test` runs.
@@ -98,7 +98,7 @@ LocalStack.
 
 Copies of the main docs are in [`docs/`](docs/): [architecture](docs/01-ARCHITECTURE.md),
 [database](docs/02-DATABASE.md) and [security](docs/03-SECURITY.md). The ADRs, SLOs, runbook,
-postmortem and cloud lab are in the [main repo](https://github.com/jani358/BookLK/tree/main/docs).
+postmortem and cloud lab are in [docs](docs/) (the full set lives in the private repo).
 
 ## License
 
