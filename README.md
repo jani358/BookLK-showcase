@@ -1,83 +1,105 @@
-# BookLK — Multi-vendor Booking Marketplace (SaaS) · Showcase
+# BookLK
 
-> **This is a public showcase of a private product.** The full source is private (it is being built as a SaaS).
-> This repo contains the architecture, database and security design, selected code excerpts, and a demo,
-> so that recruiters and clients can evaluate the concept and the engineering quality.
-> Full read-only source access can be granted on request for interviews. See [LICENSE](LICENSE).
+**Full source: [github.com/jani358/BookLK](https://github.com/jani358/BookLK)**
 
-**Author:** Janindu Gayanga · [iamjanindu.com](https://iamjanindu.com) · [LinkedIn](https://www.linkedin.com/in/janindu-gayanga-02ba60217) · janindugayanga10@gmail.com
+A multi-vendor booking marketplace for Sri Lanka. Salons, clinics, tutors and repair shops publish time
+slots, customers book and pay, vendors get paid out, and the platform keeps a commission.
 
----
+This repo used to stand in for a private codebase. The main repo is public now, so this is a short tour
+with a few excerpts. Everything else, including all the tests, is in the main repo.
 
-## What it is
+Janindu Gayanga · [iamjanindu.com](https://iamjanindu.com) · [LinkedIn](https://www.linkedin.com/in/janindu-gayanga-02ba60217) · janindugayanga10@gmail.com
 
-BookLK lets any service business in Sri Lanka (salons, clinics, tutors, vehicle service, studios, sports courts)
-publish bookable time slots, take online bookings and payments, and manage customers from one dashboard —
-without building their own system. Customers search, book, pay and get real-time updates.
+![Vendor page with the live slot picker](screenshots/03-vendor-page-slots.png)
 
-**Live demo:** _coming soon_ · **Demo video (3 min):** _coming soon_
+## What's in it
 
-## Features
+- A NestJS API for auth, vendors, services, slots, bookings, payments, reviews and admin, plus a public
+  GraphQL endpoint for catalogue reads (DataLoader, depth and cost limits, persisted queries).
+- A Go service that pushes live slot and booking changes over WebSockets.
+- Payments through Stripe (test mode) and PayHere (sandbox) behind one port, with a deterministic fake
+  that the tests use. Webhooks land in a separate Express service.
+- A transactional outbox and a relay into Redpanda (the Kafka API), idempotent consumers, and
+  dead-letter topics that admins can replay.
+- BullMQ jobs for refunds, receipt PDFs, reminders, payout batches and a nightly reconciliation.
+- MongoDB read models for the vendor activity feed and notification inbox. Money stays in Postgres.
+- A Next.js 14 web app, a Helm chart, a local k3d cluster with ArgoCD, and Terraform for one EC2 + K3s
+  node.
 
-| Area | What is built |
-|---|---|
-| Vendors | Onboarding, services & pricing, slot calendar, staff, reviews, analytics |
-| Customers | Search & filter, vendor pages (SEO), booking flow, payments, booking history, reviews |
-| Bookings | **Double-booking prevention under concurrency** (idempotency key → Redis lock → row lock in Serializable tx → DB unique constraint) |
-| Payments | Provider abstraction (multiple gateways behind one interface), HMAC-verified webhooks, idempotent processing |
-| Real-time | Go WebSocket service: live slot availability & booking status, Redis pub/sub across nodes |
-| Auth & security | JWT access + refresh rotation with reuse detection, RBAC (customer / vendor / admin), rate limiting, CSP, SameSite cookies |
-| Platform | Docker Compose, GitHub Actions CI (lint · unit · e2e · `go test -race`), Kubernetes manifests, OpenAPI docs |
+## The bits worth reading
 
-## Stack
+### Double booking
 
-- **API:** NestJS · TypeScript · Prisma · PostgreSQL · Redis · Swagger/OpenAPI · Jest
-- **Real-time:** Go · gorilla/websocket · worker pool · Redis pub/sub · Prometheus metrics
-- **Web:** Next.js 14 App Router (SSG / SSR / CSR per route) · TanStack Query · Zustand · Tailwind · lucide-react · PWA · Playwright
-- **Infra:** Docker · docker-compose · GitHub Actions · Kubernetes (manifests) · AWS-ready
+Four layers. An idempotency key, stored as a unique column in Postgres, is checked before any lock, so
+a retried request gets the first answer back. A Redis `SET NX EX` lock is a cheap first filter and
+nothing more. The real guarantee is `SELECT ... FOR UPDATE` on the slot inside the transaction, and a
+unique `activeSlotId` column is the database backstop. That column is cleared on cancellation, so a freed
+slot can be booked again while the cancelled row stays as history.
 
-## Architecture
+The transaction started out at `SERIALIZABLE`. The k6 spike showed Postgres aborting bookings for
+*different* slots and leaving them unsold, so it now runs at `READ COMMITTED`. That's enough because
+every row it decides on is locked explicitly. A test fires 20 parallel bookings at one slot and checks
+exactly one wins.
 
-```
-┌──────────┐   HTTPS    ┌───────────────┐   Prisma   ┌────────────┐
-│ Next.js  │ ─────────▶ │  NestJS API   │ ─────────▶ │ PostgreSQL │
-│  (web)   │            │ (REST/OpenAPI)│            └────────────┘
-└────┬─────┘            └──────┬────────┘
-     │ WSS                     │ publish (Redis pub/sub)
-     ▼                         ▼
-┌──────────┐            ┌───────────────┐
-│ Go       │ ◀───────── │    Redis      │  (locks, cache, pub/sub)
-│ realtime │  subscribe └───────────────┘
-└──────────┘
-```
+[`samples/api-bookings/`](samples/api-bookings/)
 
-Full write-ups: [docs/01-ARCHITECTURE.md](docs/01-ARCHITECTURE.md) · [docs/02-DATABASE.md](docs/02-DATABASE.md) · [docs/03-SECURITY.md](docs/03-SECURITY.md)
+### Never publish from a request handler
 
-## Code excerpts (read-only)
+"Commit the booking, then publish the event" loses the event if the process dies in between, and
+publishing first can announce a booking that rolls back. So the event goes into an outbox table in the
+same transaction, and a relay publishes it with `FOR UPDATE SKIP LOCKED`. There's an integration test
+that kills the relay before publishing, and again after publishing but before marking the row sent. No
+event is lost; the only duplicates are the at-least-once kind the consumers already dedupe.
 
-| File | Why it is here |
-|---|---|
-| [samples/api-bookings/bookings.service.ts](samples/api-bookings/bookings.service.ts) | The booking transaction: idempotency, Redis `SET NX`, `SELECT … FOR UPDATE`, Serializable isolation, unique constraint as last line of defence |
-| [samples/api-bookings/bookings.service.spec.ts](samples/api-bookings/bookings.service.spec.ts) | Unit tests for the concurrency paths |
-| [samples/realtime-hub/hub.go](samples/realtime-hub/hub.go) | WebSocket hub: goroutine-per-connection, worker pool fan-out, panic/recover, backpressure |
-| [samples/realtime-hub/hub_test.go](samples/realtime-hub/hub_test.go) | Race-detector tests for the hub |
-| [docs/docker-compose.reference.yml](docs/docker-compose.reference.yml) | How the services are wired locally |
+### Money
+
+Webhooks are verified against the raw body, processed idempotently, and recorded in an append-only
+ledger (a trigger rejects `UPDATE`). Commission is in integer basis points. Refunds are reversal
+entries, and the vendor is clawed back in the next payout batch. Every night, reconciliation compares
+the provider's records with payments and the ledger. A test drops a webhook on purpose and checks the
+gap is found and can be repaired.
+
+### The Go hub
+
+One goroutine owns the connection map and everything else talks to it over channels. Every spawned
+goroutine recovers from panics, because in Go one unrecovered panic kills the whole process. Slow
+clients are dropped instead of blocking the hub. Events arrive through Kafka (a consumer group per
+instance), deduped by `eventId` and ordered per slot by version. I haven't load-tested the number of
+connections it can hold.
+
+[`samples/realtime-hub/`](samples/realtime-hub/)
+
+## Numbers, including the bad one
+
+- k6 booking spike on k3d: **zero double bookings** at 200 users racing for 20 slots and at 500 for 50.
+- The booking latency target (p95 under 300 ms) **was not met**: about 3.2 s at 200 users and 6.0 s at
+  500, on one laptop with the API pod CPU-bound. The
+  [load test report](https://github.com/jani358/BookLK/blob/main/docs/LOAD-TEST-REPORT.md) has what I'd
+  try next.
+- Tests: 201 API unit, 65 API integration on real Postgres, Redis, Redpanda and Mongo, 39 for the
+  webhooks service, 51 Go, 25 web unit, 6 Playwright, 11 Helm chart, and 34 `terraform test` runs.
+
+## What "cloud" means here
+
+Nothing runs on a paid account. Kubernetes ran on a local k3d cluster (Helm install, ArgoCD sync from
+an in-cluster Gitea, the k6 spike). The Terraform was validated, planned offline and applied only to
+LocalStack.
 
 ## Screenshots
 
 | | |
 |---|---|
-| **Home** — SSG landing with featured vendors<br>![Home](screenshots/01-home.png) | **Browse vendors** — cursor-paginated search by city/name<br>![Browse](screenshots/02-vendors-search.png) |
-| **Vendor page** — services + live slot picker (WebSocket "Live" badge)<br>![Vendor](screenshots/03-vendor-page-slots.png) | **Booking confirmation** — idempotent create + payment intent<br>![Booking](screenshots/05-booking-flow.png) |
-| **Customer dashboard** — upcoming/past, cancel<br>![Customer](screenshots/06-customer-dashboard.png) | **Vendor dashboard** — incoming bookings, services, slot generator<br>![Vendor dashboard](screenshots/07-vendor-dashboard.png) |
-| **OpenAPI docs** — every route documented<br>![OpenAPI](screenshots/08-openapi-docs.png) | **Mobile / PWA** — responsive, installable<br>![Mobile](screenshots/09-mobile-vendor.png) ![Mobile home](screenshots/10-mobile-home.png) |
+| ![Home](screenshots/01-home.png)<br>Home | ![Browse](screenshots/02-vendors-search.png)<br>Browse vendors |
+| ![Booking](screenshots/05-booking-flow.png)<br>Booking confirmation | ![Customer](screenshots/06-customer-dashboard.png)<br>Customer dashboard |
+| ![Vendor dashboard](screenshots/07-vendor-dashboard.png)<br>Vendor dashboard | ![OpenAPI](screenshots/08-openapi-docs.png)<br>OpenAPI docs |
+| ![Mobile home](screenshots/10-mobile-home.png)<br>Mobile | ![Mobile vendor](screenshots/09-mobile-vendor.png)<br>Mobile vendor page |
 
-## Status & roadmap
+## Docs
 
-MVP complete (API 38 routes · web 16 routes · realtime service · CI). Next: payments go-live (LankaQR / PayHere), vendor
-subscriptions (SaaS billing), multi-tenant custom domains, RAG assistant for vendor FAQs.
+Copies of the main docs are in [`docs/`](docs/): [architecture](docs/01-ARCHITECTURE.md),
+[database](docs/02-DATABASE.md) and [security](docs/03-SECURITY.md). The ADRs, SLOs, runbook,
+postmortem and cloud lab are in the [main repo](https://github.com/jani358/BookLK/tree/main/docs).
 
-## Access to full source
+## License
 
-Interviewers / hiring managers: email me and I will add you as a **read-only collaborator** on the private repo for the
-duration of the process.
+Copyright (c) 2026 Janindu Gayanga. All rights reserved. See [LICENSE](LICENSE).
