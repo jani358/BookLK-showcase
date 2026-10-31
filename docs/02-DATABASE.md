@@ -3,6 +3,15 @@
 PostgreSQL 16 via Prisma. This document covers every table, the reasoning behind each
 column, the index strategy, the slot state machine, money representation, and migrations.
 
+> **Source of truth:** [`apps/api/prisma/schema.prisma`](https://github.com/jani358/BookLK/blob/main/apps/api/prisma/schema.prisma)
+> and its migrations. The diagrams below use snake_case and show the designed model; a
+> few designed columns are not in the current schema. For example, `Booking` has
+> `slotId`, `activeSlotId`, `customerId`, `vendorId`, `serviceId`, `status`
+> (`PENDING | CONFIRMED | CANCELLED | COMPLETED`), `priceCents`, `idempotencyKey`,
+> `createdAt`, `cancelledAt` and `reminderSentAt`; there is no `reference`, no
+> `NO_SHOW`, and the commission split is computed on the payment, not snapshotted on
+> the booking. When this doc and the schema disagree, the schema wins.
+
 ---
 
 ## 1. ER diagram
@@ -58,7 +67,7 @@ column, the index strategy, the slot state machine, money representation, and mi
     │                          │ updated_at      tstz       │
     │                          └──────┬─────────────────────┘
     │                                 │1
-    │                                 │1  (slot_id is UNIQUE on bookings)
+    │                                 │1  (active_slot_id is UNIQUE on bookings)
     │N                         ┌──────▼─────────────────────────┐
     └─────────────────────────►│           bookings             │
       customer_id              │────────────────────────────────│
@@ -67,13 +76,14 @@ column, the index strategy, the slot state machine, money representation, and mi
                                │ customer_id     uuid FK        │
                                │ vendor_id       uuid FK        │
                                │ service_id      uuid FK        │
-                               │ slot_id         uuid FK UNIQUE │◄── the safety net
+                               │ slot_id         uuid FK        │  every booking ever
+                               │ active_slot_id  uuid FK UNIQUE │◄── the safety net (NULL once cancelled)
                                │ status          enum           │
                                │ price_cents     int            │  snapshot
                                │ commission_cents int           │  snapshot
                                │ vendor_amount_cents int        │  snapshot
                                │ currency        char(3)        │
-                               │ idempotency_key text           │
+                               │ idempotency_key text UNIQUE    │
                                │ starts_at       tstz           │  denormalised
                                │ cancelled_at    tstz           │
                                │ cancel_reason   text           │
@@ -190,11 +200,12 @@ The contended resource. This is where concurrency lives.
 | Column | Type | Why |
 |---|---|---|
 | `reference` | `text` UNIQUE | Human-facing (`BK-2026-0001A3`). Support conversations need something a customer can read over the phone; nobody reads a UUID aloud. |
-| `slot_id` | `uuid` FK **UNIQUE** | **The single most important constraint in the schema.** One slot can back at most one booking, enforced by the database. Application logic and Redis locks can both be wrong; a unique index cannot. If everything else fails, the second insert raises `23505` and the customer sees "slot just taken" rather than arriving to a double-booked chair. |
+| `slot_id` | `uuid` FK | Every booking ever made for the slot, cancelled ones included. |
+| `active_slot_id` | `uuid` FK **UNIQUE**, nullable | **The single most important constraint in the schema** (since Phase 2, [ADR 0002](https://github.com/jani358/BookLK/blob/main/docs/adr/0002-active-slot-uniqueness.md)). Equals `slot_id` while the booking holds the slot and is set to NULL on cancellation; UNIQUE allows many NULLs, so one slot backs at most one *active* booking and a freed slot can be rebooked. Two CHECKs tie it to `slot_id` and to `status <> CANCELLED`. Before Phase 2 the UNIQUE sat on `slot_id` itself, which blocked rebooking a cancelled slot. Application logic and Redis locks can both be wrong; a unique index cannot. If everything else fails, the second insert raises `23505` and the customer sees "slot just taken" rather than arriving to a double-booked chair. |
 | `price_cents`, `commission_cents`, `vendor_amount_cents` | `int` | **Snapshots, not joins.** If a vendor raises their price or renegotiates commission tomorrow, last month's booking and its ledger must still reconcile. Deriving money at read time from mutable rows is how ledgers silently stop balancing. Deliberate denormalisation. |
-| `idempotency_key` | `text` | The client-supplied key that made the create call retry-safe. Kept on the row for audit even after the Redis entry expires. |
+| `idempotency_key` | `text` UNIQUE, nullable | The client-supplied key that makes the create call retry-safe. The idempotency check is a lookup on this unique column in Postgres (no Redis entry): a replay with the same key returns the existing booking, and two racing first attempts cannot both insert. |
 | `starts_at` | `timestamptz` | Denormalised from the slot so "my upcoming bookings" is one indexed query with no join. |
-| `status` | `enum` | `PENDING_PAYMENT \| CONFIRMED \| CANCELLED \| COMPLETED \| NO_SHOW`. |
+| `status` | `enum` | `PENDING \| CONFIRMED \| CANCELLED \| COMPLETED`. |
 | `cancelled_at`, `cancel_reason` | | Refund policy is time-based, so *when* the cancellation happened is a money-relevant fact. |
 
 ### `payments`
@@ -244,6 +255,51 @@ A durable queue row per vendor payout, with `attempts`, `next_attempt_at` (expon
 backoff), and `last_error`. Payouts move real money to third parties and must survive a
 process restart, so the queue is a table, not an in-memory job list.
 
+### `OutboxEvent` — transactional outbox (Phase 1)
+
+One row per domain event, INSERTed in the same transaction as the booking or payment
+change it describes (see [ADR 0001](https://github.com/jani358/BookLK/blob/main/docs/adr/0001-outbox-over-dual-writes.md)). `id` (uuid) is
+the event's `eventId`. `seq` (bigserial) gives the insert order, because `createdAt`
+cannot: Postgres `now()` is the transaction start time, so every row of one transaction
+ties. `payload` is the full JSON envelope, `topic` the destination, `publishedAt` is NULL
+until the relay has published it, and `attempts` / `lastError` / `nextAttemptAt` drive
+backoff. Indexes: `(publishedAt, nextAttemptAt, seq)` for the relay's claim query and
+`(aggregateType, aggregateId, seq)` for its head-of-line check.
+
+### `ProcessedEvent` — consumer dedupe
+
+Primary key `(eventId, consumer)`. A consumer inserts its row with `ON CONFLICT DO
+NOTHING` in the same transaction as its own writes, so a redelivered event changes
+nothing. Keyed per consumer: one event is processed once by *each* consumer.
+
+### `Notification`
+
+Written by the notification-sender consumer. `commandId` is UNIQUE (the
+`notification.send` command's eventId), a second guard against sending twice.
+
+### Phase 2: payments that reconcile
+
+| Table | What it holds | Key constraints |
+|---|---|---|
+| `Refund` | One refund of all or part of a payment: amount, frozen fee/vendor split, reason, status (PENDING, SUCCEEDED, FAILED), provider refund id, attempts | UNIQUE `idempotencyKey`, UNIQUE `providerRefundRef`, CHECK split sums and amount > 0 |
+| `LedgerEntry` (new columns) | `paymentId`, `refundId` on reversal entries | UNIQUE `(refundId, type)`; a trigger rejects every UPDATE |
+| `Payment` (new columns) | `currency`, `refundedCents`, `providerChargeId`; status adds PARTIALLY_REFUNDED | CHECK split sums, `0 <= refundedCents <= amountCents` |
+| `Payout` (new columns) | `paymentId`, `refundId` (negative clawback rows), `batchId` | UNIQUE `refundId` |
+| `PayoutBatch` | One netted transfer per vendor per run; its id is the transfer idempotency key | CHECK amount > 0, UNIQUE `transferRef` |
+| `InboundWebhook` | Every verified provider webhook, written by apps/webhooks with its outbox row | UNIQUE `(provider, providerEventId)` |
+| `Receipt` | The generated PDF's number (BLK-YYYY-NNNNNN), storage key, SHA-256 | UNIQUE `paymentId`, `sequence`, `receiptNumber` |
+| `Booking.reminderSentAt` | Stamped once by the reminders job | the conditional update on NULL is the gate |
+| `ReconciliationRun` / `ReconciliationIssue` | Nightly comparison runs and the gaps they found | UNIQUE `(kind, provider, providerRef)` so a recurring gap is one issue |
+
+Reasoning: [ADR 0003](https://github.com/jani358/BookLK/blob/main/docs/adr/0003-payment-providers-and-webhooks-service.md),
+[ADR 0004](https://github.com/jani358/BookLK/blob/main/docs/adr/0004-refunds-as-ledger-reversals.md),
+[ADR 0005](https://github.com/jani358/BookLK/blob/main/docs/adr/0005-bullmq-jobs-and-nightly-reconciliation.md).
+
+> Migrations: `prisma/migrations/20260901000000_init` is the baseline of the pre-Phase-1
+> schema, and `20261030000000_event_backbone` adds the three tables above. A database
+> created earlier with `prisma db push` is baselined with
+> `pnpm exec prisma migrate resolve --applied 20260901000000_init`.
+
 ---
 
 ## 3. Index strategy
@@ -258,7 +314,7 @@ Every index is a write-time cost and disk. These exist because a specific query 
 | `(vendor_id, is_active)` | services | Vendor page service list | |
 | **`(vendor_id, starts_at, status)`** | slots | **The hottest query in the app** | See below |
 | `(status, held_until)` | slots | Expiry sweeper finding stale `HELD` rows | Partial: `WHERE status = 'HELD'` |
-| `UNIQUE (slot_id)` | bookings | The double-booking guarantee | Correctness first, speed second |
+| `UNIQUE (active_slot_id)` | bookings | The double-booking guarantee (NULL once cancelled, so many cancelled rows are allowed) | Correctness first, speed second; plus a plain index on `slot_id` for history |
 | `(customer_id, starts_at DESC)` | bookings | "My bookings", newest first | `DESC` matches ORDER BY, so no sort node |
 | `(vendor_id, starts_at)` | bookings | Vendor's day view | |
 | `UNIQUE (reference)` | bookings | Support lookup | |
@@ -491,7 +547,9 @@ Full worked example including refunds in `05-SAAS-MODEL.md` §4.
 
 ## 7. Migration strategy
 
-Prisma Migrate, checked into git, applied automatically in CI/CD.
+Prisma Migrate, checked into git. CI applies them to a fresh database with
+`pnpm prisma:deploy` before the integration tests; in the k3d lab the chart runs them
+before the API starts.
 
 ```bash
 # Development — creates a timestamped SQL file, applies it, regenerates the client
@@ -553,7 +611,7 @@ query to have memorised.
 ### Locking a slot to book it
 
 ```sql
-BEGIN ISOLATION LEVEL SERIALIZABLE;
+BEGIN ISOLATION LEVEL READ COMMITTED;   -- the explicit locks below are the guarantee
 
 SELECT id, status, version
 FROM slots
@@ -565,7 +623,7 @@ FOR UPDATE;                      -- blocks other writers on THIS row only
 UPDATE slots SET status = 'BOOKED', version = version + 1, updated_at = now()
 WHERE id = $1;
 
-INSERT INTO bookings (...) VALUES (...);   -- UNIQUE(slot_id) is the backstop
+INSERT INTO bookings (..., active_slot_id) VALUES (..., $1);   -- UNIQUE(active_slot_id) is the backstop
 
 COMMIT;
 ```

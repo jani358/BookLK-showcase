@@ -26,25 +26,29 @@ This document explains what each piece is, why it exists, and what was rejected.
               │  services · slots        │    │  goroutine per conn    │
               │  bookings · payments     │    │  bounded worker pool   │
               │  reviews · health        │    │  heartbeat ping/pong   │
-              │  Swagger /docs           │    │  /health  /metrics     │
-              └────┬──────────────┬──────┘    └──────────┬─────────────┘
-                   │              │                      │
-     Prisma / SQL  │              │ ioredis              │ go-redis
-                   │              │                      │
-        ┌──────────▼───────┐   ┌──▼──────────────────────▼─────────────┐
-        │  PostgreSQL 16   │   │             Redis 7                   │
-        │                  │   │                                       │
-        │  users, vendors  │   │  slot short-locks (SET NX PX)         │
-        │  services, slots │   │  sliding-window rate limit counters   │
-        │  bookings        │   │  refresh-token / session side data    │
-        │  payments        │   │  pub/sub channel  booklk:slots        │
-        │  ledger_entries  │   │  read-through cache for hot queries   │
-        │  reviews         │   └───────────────────────────────────────┘
-        │  refresh_tokens  │
-        └──────────────────┘
+              │  notification consumers  │    │  kafka-go consumer     │
+              │  DLQ admin · Swagger     │    │  /health  /metrics     │
+              └────┬──────────────┬──────┘    └────▲──────────┬────────┘
+                   │              │                │          │
+     Prisma / SQL  │              │ ioredis        │ kafka    │ go-redis
+     (state + outbox row          │                │          │
+      in ONE transaction)         │                │          │
+        ┌──────────▼───────┐   ┌──▼────────────────┼──────────▼────────────┐
+        │  PostgreSQL 16   │   │             Redis 7                       │
+        │                  │   │  slot short-locks (SET NX EX)             │
+        │  users, vendors  │   │  sliding-window rate limit counters       │
+        │  services, slots │   │  pub/sub booklk:slots (ephemeral hints)   │
+        │  bookings        │   │  read-through cache for hot queries       │
+        │  payments        │   └───────────────────────────────────────────┘
+        │  ledger_entries  │
+        │  OutboxEvent     │──poll──► outbox relay ──► Redpanda (Kafka API)
+        │  ProcessedEvent  │          (FOR UPDATE      booking.events
+        │  Notification    │           SKIP LOCKED)    payment.events
+        └──────────────────┘                           notification.commands
+                                                       + <topic>.dlq
 
         Observability:  Sentry (errors) · Prometheus scrape → Grafana (metrics)
-        Delivery:       Docker Compose (local) · GitHub Actions → registry → K8s / VPS
+        Delivery:       Docker Compose · GitHub Actions CI · Helm on k3d (local) · ArgoCD
 ```
 
 The write path and the fan-out path are deliberately separated. **The API owns all state
@@ -70,6 +74,8 @@ The system of record. Everything that changes state goes through here.
 | `payments` | Mock provider, webhooks, ledger, payout queue | Money code should be isolated and heavily tested |
 | `reviews` | Post-completion ratings | Different consistency needs from bookings |
 | `health` | Liveness/readiness with dependency checks | Kubernetes and load balancers need a real answer |
+| `events` | Outbox writes, relay, Kafka client, idempotent consumer runner, DLQ admin API | The delivery guarantees live in one place; feature modules only call `outbox.enqueue(tx, …)` |
+| `notifications` | First real consumers: booking events → notification commands → Notification rows | Shows the consumer pattern end to end, and is where an email/SMS provider plugs in |
 
 NestJS gives module boundaries, dependency injection, guards/interceptors/pipes as
 first-class concepts, and decorator-driven Swagger. On a project whose selling point is
@@ -124,10 +130,15 @@ token that dies in 15 minutes. See `03-SECURITY.md`.
 ### Infrastructure
 
 - **PostgreSQL 16** — bookings, money, users. Anything needing transactions or joins.
-- **Redis 7** — short slot locks, rate-limit counters, pub/sub fan-out, hot-query cache.
-- **Docker Compose** for local dev, Dockerfiles per service, GitHub Actions for CI/CD,
-  Kubernetes manifests for the production target, Sentry + Prometheus/Grafana for
-  operations.
+- **Redis 7** — short slot locks, rate-limit counters, ephemeral pub/sub hints, hot-query cache.
+- **Redpanda** (Kafka API) — durable domain events: `booking.events`, `payment.events`,
+  `payment.webhooks`, `notification.commands`, each with a `.dlq`. Fed only by the transactional outbox.
+- **BullMQ** on the same Redis — refunds, receipt PDFs, reminders, daily payouts, nightly
+  reconciliation, run by the worker process (`dist/worker.js`). Bull Board at `/admin/queues`.
+- **Docker Compose** for local dev (`--profile events` adds Redpanda + Console),
+  Dockerfiles per service, GitHub Actions for CI. Kubernetes runs from the Helm chart in
+  `deploy/helm/booklk` (tested on a local k3d cluster). Prometheus metrics (API, relay,
+  Go hub), a Grafana dashboard and optional Sentry are in place (Phase 5).
 
 ---
 
@@ -147,26 +158,27 @@ The single most likely thing you will be asked to walk through. Follow the numbe
  4  │              ValidationPipe: DTO + whitelist │                  │              │
  5  │              RateLimitGuard ────────────────►│ INCR window key  │              │
     │                        │◄──── count ok ──────│                  │              │
- 6  │              Idempotency: SETNX idem:k ─────►│                  │              │
-    │                        │  already exists? ──► return stored response, STOP     │
- 7  │              Slot lock: SET lock:slot:<id> NX PX 10000          │              │
+ 6  │              Idempotency: SELECT booking WHERE idempotencyKey=k ►│              │
+    │                        │  found? ───────────► return that booking, STOP        │
+ 7  │              Slot lock: SET lock:slot:<id> <token> EX 10 NX     │              │
     │                        │  not acquired? ────► 409 slot busy, STOP              │
     │                        │                     │                  │              │
- 8  │              BEGIN ISOLATION LEVEL SERIALIZABLE ───────────────►│              │
+ 8  │              BEGIN ISOLATION LEVEL READ COMMITTED ─────────────►│              │
  9  │              SELECT * FROM slots WHERE id=$1 FOR UPDATE ───────►│              │
 10  │              status must be FREE, else ROLLBACK → 409           │              │
 11  │              UPDATE slots SET status='BOOKED' ─────────────────►│              │
-12  │              INSERT INTO bookings (... slot_id UNIQUE) ────────►│              │
-13  │              INSERT payment PENDING + ledger rows ─────────────►│              │
-14  │              COMMIT ──────────────────────────────────────────►│              │
+12  │              INSERT bookings (... activeSlotId UNIQUE) ────────►│              │
+13  │              INSERT "OutboxEvent" booking.created.v1 ──────────►│              │
+14  │              COMMIT  (booking + slot + event, all or nothing) ─►│              │
     │                        │                     │                  │              │
-15  │              Store response under idem:k ───►│                  │              │
-16  │              PUBLISH booklk:slots {...} ────►│──── fan-out ────────────────────►│
-17  │◄─ 201 Created ─────────│                     │                  │              │
+15  │  Release slot lock (DEL) — or let the 10s TTL expire            │              │
+16  │◄─ 201 Created ─────────│                     │                  │              │
+    │                        │                     │                  │              │
+17  │        outbox relay: claim row FOR UPDATE SKIP LOCKED ◄────────│              │
+18  │        produce to Kafka booking.events (key = bookingId) ──────────────────────►│
+19  │        mark publishedAt, COMMIT ───────────────────────────────►│   dedupe,
     │                        │                     │                  │   push to all
-18  │◄══════════ WS: {type:"slot.updated", status:"BOOKED"} ══════════════ watchers ═╡
-    │                        │                     │                  │              │
-19  │  Release slot lock (DEL) — or let the 10s TTL expire            │              │
+20  │◄══════════ WS: {type:"slot.updated", status:"BOOKED", version} ════ watchers ═╡
 ```
 
 Points worth narrating out loud:
@@ -174,76 +186,185 @@ Points worth narrating out loud:
 - **Steps 7 and 9 are two different locks, on purpose.** The Redis lock is a cheap
   first-line filter that rejects the 49 losers of a 50-way race before they ever touch a
   database connection. It is *not* the correctness guarantee — Redis locks can be lost to
-  network partitions and clock skew. The `SELECT ... FOR UPDATE` inside the Serializable
+  network partitions and clock skew. The `SELECT ... FOR UPDATE` inside the READ COMMITTED
   transaction is the correctness guarantee, and the `UNIQUE` constraint on
-  `bookings.slot_id` is the last line of defence that turns any remaining bug into a
+  `Booking.activeSlotId` is the last line of defence that turns any remaining bug into a
   constraint violation instead of a double-booked customer.
-- **Step 16 happens after COMMIT, never before.** Publishing inside the transaction would
-  broadcast a booking that could still roll back. The cost of publishing after commit is
-  that a crash between 14 and 16 loses the notification — acceptable, because the next
-  page load reads true state from Postgres. Choosing "possible missed notification" over
-  "possible false notification" is the right trade for this domain.
-- **Step 6 makes the whole endpoint safe to retry.** A mobile client that times out at
-  step 14 and retries gets the stored 201, not a second booking.
+- **The event is a row in the same transaction (step 13), not a publish.** Publishing
+  from the handler is a dual write: publish before COMMIT and you can announce a booking
+  that rolls back; publish after COMMIT and a crash in between loses the event. The
+  outbox removes both failure modes: the event exists if and only if the booking does.
+  The relay (steps 17-19) delivers it at least once, so a relay crash after step 18 can
+  produce a duplicate, and every consumer dedupes on `eventId`. See
+  [ADR 0001](https://github.com/jani358/BookLK/blob/main/docs/adr/0001-outbox-over-dual-writes.md).
+- **Step 6 makes the whole endpoint safe to retry.** The idempotency key is a UNIQUE
+  column on `Booking` in Postgres, not a Redis entry. A mobile client that times out at
+  step 14 and retries with the same key gets the existing booking, not a second one; two
+  first attempts racing with one key cannot both insert, because the second hits the
+  unique index.
+- **Why READ COMMITTED, not Serializable.** Every row the transaction decides on is
+  locked explicitly (the slot by `FOR UPDATE`, the booking by `UNIQUE(activeSlotId)`).
+  Serializable was used at first, and the k6 spike showed it aborting bookings for
+  *different* slots and leaving slots unsold; see the
+  [ADR 0002 update](https://github.com/jani358/BookLK/blob/main/docs/adr/0002-active-slot-uniqueness.md) and
+  [LOAD-TEST-REPORT](https://github.com/jani358/BookLK/blob/main/docs/LOAD-TEST-REPORT.md).
 
 ---
 
-## 4. Data flow for realtime updates
+## 4. Event flow: outbox → Kafka → consumers
+
+Every booking and payment state change emits a versioned event (`booking.created.v1`,
+`booking.confirmed.v1`, `booking.cancelled.v1`, `booking.completed.v1`,
+`payment.initiated.v1`, `payment.succeeded.v1`, `payment.failed.v1`,
+`payment.refunded.v1`). The schemas are zod definitions in
+`apps/api/src/events/schemas.ts`; each envelope carries `eventId`, `type`, `version`,
+`occurredAt`, `aggregateType`, `aggregateId` and a typed `data` body.
+
+```mermaid
+flowchart LR
+    subgraph API["apps/api (NestJS)"]
+        H["Request handler<br/>bookings / payments"]
+        D["notification-dispatcher<br/>consumer"]
+        S["notification-sender<br/>consumer"]
+        ADM["POST /admin/dlq/:topic/replay<br/>(ADMIN only)"]
+    end
+
+    subgraph PG["PostgreSQL"]
+        T[("bookings, slots,<br/>payments, ledger")]
+        O[("OutboxEvent")]
+        P[("ProcessedEvent<br/>(eventId, consumer)")]
+        N[("Notification")]
+    end
+
+    R["Outbox relay<br/>pnpm start:relay<br/>FOR UPDATE SKIP LOCKED"]
+
+    subgraph K["Redpanda (Kafka API)"]
+        BE[["booking.events"]]
+        PE[["payment.events"]]
+        NC[["notification.commands"]]
+        DLQ[["*.dlq"]]
+    end
+
+    RT["apps/realtime (Go)<br/>group per instance<br/>dedupe by eventId"]
+    WS(("Browsers<br/>WebSocket"))
+
+    H -- "one transaction" --> T
+    H -- "one transaction" --> O
+    R -- "poll unpublished rows" --> O
+    R -- "idempotent producer<br/>key = aggregateId" --> BE
+    R --> PE
+    R --> NC
+    BE --> RT --> WS
+    BE --> D
+    D -- "dedupe row + outbox row<br/>in one transaction" --> P
+    D --> O
+    NC --> S
+    S -- "dedupe row + notification<br/>in one transaction" --> N
+    S --> P
+    D -. "after N retries" .-> DLQ
+    S -. "after N retries" .-> DLQ
+    ADM -- "copy back to the main topic" --> DLQ
+```
+
+### The pieces
+
+| Piece | Where | What it guarantees |
+|---|---|---|
+| Outbox write | `OutboxService.enqueue(tx, …)` inside the booking / payment transaction | The event exists if and only if the state change committed. The method only accepts a transaction client, so "publish outside the transaction" cannot be written by accident. Bodies are validated with zod at write time, so a bad event fails its own request instead of poisoning consumers. |
+| Relay | `OutboxRelayService`, run in-process (`OUTBOX_RELAY_ENABLED=true`) or standalone (`pnpm start:relay`) | One Postgres transaction per batch: claim rows `FOR UPDATE SKIP LOCKED`, produce with acks=all, then mark `publishedAt`. A crash before the produce loses nothing; a crash after it re-publishes the batch (at-least-once). Failed batches back off exponentially (`attempts`, `lastError`, `nextAttemptAt`). Only the OLDEST unpublished event of each aggregate is eligible, so per-aggregate order survives retries and multiple relay replicas. |
+| Kafka | `booking.events` / `payment.events` / `notification.commands` (3 partitions) + `.dlq` (1) | Messages are keyed by aggregate id, so one booking's events stay ordered on one partition. Topics are created by the compose init container and, idempotently, by the API on boot. |
+| Idempotent consumers | `IdempotentEventProcessor` + `EventConsumerService` (one KafkaJS consumer group per handler) | The handler runs inside a transaction that also inserts `(eventId, consumer)` into `ProcessedEvent` with `ON CONFLICT DO NOTHING`. Its writes therefore happen once per consumer, however often the event is delivered. Failures retry with backoff, then go to `<topic>.dlq` with error metadata headers. |
+| DLQ replay | `POST /api/admin/dlq/:topic/replay` (admin), `GET /api/admin/dlq/:topic` | Copies parked messages back to their original topic. The consumer that failed processes them; the ones that already succeeded skip them through dedupe. Progress is a committed offset, so each message is replayed once. |
+| Realtime hub | `apps/realtime/internal/consumer` (kafka-go) | Maps `booking.created/confirmed` to `slot.updated BOOKED` and `booking.cancelled` to `FREE`. Dedupes by `eventId` in a bounded LRU, and drops updates whose slot version is older than one already pushed (events of different bookings for the same slot can arrive out of order). |
+
+The first real consumer pair is notifications: `booking.confirmed` / `booking.cancelled` →
+**notification-dispatcher** writes one `notification.send.v1` command per recipient
+(customer + vendor owner) through the outbox, inside its own dedupe transaction →
+**notification-sender** records a `Notification` row (listed at `GET /api/notifications`)
+and logs it. A real email/SMS provider plugs in there.
+
+### Realtime fan-out inside the Go service
 
 ```
-apps/api                    Redis                      apps/realtime               Browser
-   │                          │                              │                        │
-   │  after COMMIT            │                              │                        │
-   │  PUBLISH booklk:slots ──►│                              │                        │
-   │  {slotId, vendorId,      │──── subscriber delivery ────►│                        │
-   │   status, version, ts}   │                              │                        │
-   │                          │                     ┌────────▼─────────┐              │
-   │                          │                     │ subscribe loop   │              │
-   │                          │                     │ (one goroutine)  │              │
-   │                          │                     └────────┬─────────┘              │
-   │                          │                              │ enqueue                │
-   │                          │                     ┌────────▼─────────┐              │
-   │                          │                     │ bounded worker   │  queue full → │
-   │                          │                     │ pool (N=16)      │  drop + count │
-   │                          │                     └────────┬─────────┘              │
-   │                          │                              │ hub.Broadcast(vendorId)│
-   │                          │                     ┌────────▼─────────┐              │
-   │                          │                     │ hub: room →      │              │
-   │                          │                     │ []*Client        │              │
-   │                          │                     └────────┬─────────┘              │
-   │                          │                              │ client.send <- msg     │
-   │                          │                     ┌────────▼─────────┐              │
-   │                          │                     │ writePump per    │══ WS frame ══►│
-   │                          │                     │ client (buffered)│              │
-   │                          │                     └──────────────────┘              │
-   │                          │                                                       │
-   │                                              queryClient.setQueryData(['slots']) ◄┘
+Kafka booking.events ──► kafka-go reader (group booklk-realtime-<hostname>)
+                              │ decode envelope, dedupe eventId, slot-version guard
+                              ▼
+Redis booklk:slots ──► subscribe loop ──► bounded worker pool (N=16)
+                              │
+                              ▼  hub.Broadcast("vendor:<vendorId>")
+                        hub: room → []*Client ──► writePump per client ══ WS frame ══► browser
+                                                                   queryClient.setQueryData()
 ```
 
 Design points:
 
-- **Redis pub/sub, not in-process events.** With three API pods and four realtime pods,
-  the pod that commits the booking is almost never the pod holding the watcher's socket.
-  Pub/sub decouples them: any API instance can reach any connection on any realtime
-  instance.
-- **Bounded worker pool, not `go func()` per message.** An unbounded spawn turns a Redis
-  message burst into an OOM. A bounded pool with a bounded queue converts overload into
-  *dropped messages plus a metric*, which is a survivable degradation — the UI is stale
-  for a few seconds and self-heals on the next fetch.
+- **One consumer group per realtime instance, not one shared group.** WebSockets are
+  sticky: the people watching vendor X are spread over every pod. A shared group would
+  split partitions between pods and each pod would see only some bookings. The default
+  group id is `booklk-realtime-<hostname>`, and a new group starts at the end of the
+  topic, because clients fetch current availability over REST when they connect.
+- **Why Redis pub/sub is still there.** Booking state is a durable domain event, so it moved
+  to Kafka: a realtime pod that restarts now resumes from its committed offset instead of
+  silently missing updates. The `booklk:slots` channel stays for *ephemeral* signals that
+  are not domain events and need no durability or replay: short checkout holds, the
+  expired-hold sweeper, and operator tooling (`cmd/wsprobe`, `redis-cli PUBLISH`). Losing
+  one of those costs seconds of stale UI, so fire-and-forget delivery is the cheaper,
+  correct tool.
+- **Dedupe in memory is enough here.** The hub changes no state; a duplicate that slips
+  past the LRU (after a restart) only re-sends a status the browser already shows.
+  Consumers that write data (notifications) dedupe durably in Postgres instead.
+- **Bounded worker pool, not `go func()` per message.** An unbounded spawn turns a burst
+  into an OOM. A bounded pool with a bounded queue converts overload into *dropped
+  messages plus a metric*, which is survivable: the UI is stale for a few seconds and
+  self-heals on the next fetch.
 - **Per-client buffered send channel with a slow-consumer policy.** If a client's buffer
   (`SEND_BUFFER_SIZE`, default 256) fills, that client is closed rather than allowed to
-  block the hub. One phone on a bad connection must not stall broadcasts to everyone else.
+  block the hub.
 - **The frontend patches the cache, it does not refetch.** The WS hook calls
-  `queryClient.setQueryData` for the affected slot. Refetching the whole availability
-  list on every message would turn one booking into a thundering herd of HTTP requests
-  from every watcher — exactly the load the WebSocket was meant to remove.
-- **At-most-once delivery, and that is fine.** Pub/sub has no persistence; a realtime pod
-  restarting misses messages. Because Postgres is the source of truth and the client
-  refetches on reconnect and on window focus, the worst case is a few seconds of stale
-  UI. Paying for guaranteed delivery (a log-based broker) to protect a *cache hint* would
-  be the wrong trade.
+  `queryClient.setQueryData` for the affected slot, so one booking does not become a
+  thundering herd of HTTP requests from every watcher.
+- **Metrics.** `/metrics` exports `booklk_realtime_kafka_messages_{consumed,duplicate,stale,ignored,invalid}_total`,
+  `booklk_realtime_kafka_errors_total` and the `booklk_realtime_kafka_consumer_lag` gauge,
+  next to the existing connection and drop counters. The API's `/health` reports the
+  outbox backlog (`pending`, `oldestPendingSeconds`) without failing the probe.
 
 ---
+
+## 4b. Payments: providers, webhooks, jobs, reconciliation (Phase 2)
+
+```mermaid
+flowchart LR
+  B[Browser] -- intent --> API[NestJS API]
+  API -- createPayment --> P[(PaymentProvider port<br/>Stripe test · PayHere sandbox · fake)]
+  B -- pays at provider --> P
+  P -- signed webhook --> W[apps/webhooks<br/>Express]
+  W -- InboundWebhook + OutboxEvent<br/>one transaction --> PG[(Postgres)]
+  PG -- relay --> K[[payment.webhooks]]
+  K --> C[payment-webhook-processor]
+  C -- PaymentLifecycleService<br/>conditional updates, ledger, outbox --> PG
+  C -. follow-ups .-> Q[(BullMQ)]
+  Q --> WK[worker: refunds · receipts · reminders · payouts · reconciliation]
+  WK -- refund / list transactions --> P
+  WK --> PG
+```
+
+- **Provider port.** `src/payments/domain/payment-provider.port.ts`; adapters for Stripe
+  (test keys only), PayHere (sandbox only) and a deterministic fake (default, used by tests).
+- **Webhooks** are verified and recorded by `apps/webhooks`, never processed inline; the
+  consumer applies them through the same idempotent lifecycle step as the fake endpoint.
+- **Money rules** are pure functions: integer basis-point commission, proportional refund
+  allocation, ledger lines and summaries, reconciliation.
+- **Refunds** are rows executed by a job, completed with reversal entries and a vendor
+  clawback; the ledger cannot be updated (trigger).
+- **Jobs** treat Postgres as the truth: they re-read their row, use deterministic ids,
+  and sweepers rebuild lost work. Payout batches net payouts and clawbacks per vendor.
+- **Reconciliation** runs nightly and turns any disagreement between provider, payment and
+  ledger into one issue plus an admin alert; a missing webhook can be healed.
+
+Decisions: [ADR 0002](https://github.com/jani358/BookLK/blob/main/docs/adr/0002-active-slot-uniqueness.md) ·
+[0003](https://github.com/jani358/BookLK/blob/main/docs/adr/0003-payment-providers-and-webhooks-service.md) ·
+[0004](https://github.com/jani358/BookLK/blob/main/docs/adr/0004-refunds-as-ledger-reversals.md) ·
+[0005](https://github.com/jani358/BookLK/blob/main/docs/adr/0005-bullmq-jobs-and-nightly-reconciliation.md).
 
 ## 5. Why three services instead of a monolith
 
@@ -267,8 +388,9 @@ you pay from day one:
 - Three deploy pipelines, three Dockerfiles, three health checks, three log streams.
 - A shared `JWT_SECRET` that two codebases in two languages must agree on — a real class
   of "works locally, 401s in prod" bugs.
-- No cross-service transaction. The publish-after-commit gap in §3 simply does not exist
-  in a monolith.
+- No cross-service transaction. The dual-write gap needs an outbox, a relay and
+  idempotent consumers (§4) — machinery a monolith calling functions in-process would
+  not need.
 - Local development needs everything running to test anything end to end.
 - Debugging a booking now spans two languages and a message bus.
 
@@ -293,8 +415,8 @@ would defend on a real team.
 | **Go** for realtime | Goroutine per connection at a few KB each; the runtime preempts, so one bad consumer cannot stall others; static binary in a tiny container; `defer`/`recover` gives per-goroutine crash containment. | A second language, second toolchain, second CI job. **Rejected:** Node WS gateway (shares the event loop with bookings), Elixir/Phoenix (arguably better at this, but a third language nobody on the team reads), managed Pusher/Ably (removes the interesting engineering, adds per-message cost). |
 | **PostgreSQL** for the core | Bookings and money need ACID, row locks, `SERIALIZABLE`, unique constraints, and joins. The double-booking guarantee is *built from* Postgres primitives. | Vertical-scaling-first; sharding is a project. **Rejected:** MySQL (fine, weaker constraint/type story), any document store for bookings (no multi-row transactional guarantee = the exact bug we are preventing). |
 | **MongoDB** for reviews / activity logs | Review documents are shape-flexible (photos, vendor replies, moderation flags), append-heavy, never join against money rows, and tolerate eventual consistency. | A second database to operate, back up, and monitor. **This is the weakest justification in the stack, and I would say so in an interview:** Postgres `JSONB` would serve reviews well and remove an entire dependency. Mongo is here because polyglot persistence with a *stated* boundary — transactional core in Postgres, flexible non-transactional content in Mongo — is a defensible pattern, not because reviews outgrew Postgres. |
-| **Redis** for locks, limits, cache, pub/sub | Single-threaded atomic ops make `SET NX PX` a correct short lock; sliding-window counters are cheap; pub/sub gives cross-instance fan-out; TTLs make expiry free. | Not durable — anything in Redis must be reconstructible from Postgres. Redis locks are an optimisation, never the correctness guarantee. |
-| **Kafka-style events** (`booking.created`, `payment.succeeded`) | Booking completion has a growing tail of side effects: notify customer, notify vendor, queue the payout, update analytics, warm search. Doing them inline makes booking slower and couples its success to an email provider's uptime. An append-only log gives durable, replayable, independently-consumable events. | Real operational weight (brokers, consumer groups, lag monitoring, at-least-once so every consumer must be idempotent). **Honest position:** at current scale Redis Streams or BullMQ delivers 90% of the value at 10% of the cost, and that is what a real team should start with. Kafka's advantage is replay — a new analytics consumer can rebuild from the beginning of the log — and *that* is the argument that justifies it later, not throughput. |
+| **Redis** for locks, limits, cache, pub/sub | Single-threaded atomic ops make `SET NX EX` a correct short lock; sliding-window counters are cheap; pub/sub gives cross-instance fan-out; TTLs make expiry free. | Not durable — anything in Redis must be reconstructible from Postgres. Redis locks are an optimisation, never the correctness guarantee. |
+| **Kafka events via a transactional outbox** (`booking.created.v1`, `payment.succeeded.v1`; Redpanda locally) | Booking completion has a growing tail of side effects: notify customer, notify vendor, queue the payout, update analytics, warm search. Doing them inline makes booking slower and couples its success to an email provider's uptime. An append-only log gives durable, replayable, independently-consumable events. | Real operational weight (brokers, consumer groups, lag monitoring, at-least-once so every consumer must be idempotent). **Honest position:** at current scale Redis Streams or BullMQ delivers 90% of the value at 10% of the cost, and that is what a real team should start with. Kafka's advantage is replay — a new analytics consumer can rebuild from the beginning of the log — and *that* is the argument that justifies it later, not throughput. |
 | **Next.js App Router** | Per-page SSG/SSR/CSR, file routing, image optimisation, one deployable frontend. | The server/client component split is genuinely confusing at first; `"use client"` boundaries need care. **Rejected:** plain React SPA (no SEO for vendor pages, which is the acquisition channel for a marketplace). |
 | **Money as integer cents** | Floats cannot represent 0.1 exactly; commission splits accumulate error; auditors do not accept "off by a cent". | Every boundary must convert deliberately. See `02-DATABASE.md` §6. |
 
@@ -311,14 +433,17 @@ would defend on a real team.
   storm. See `06-INTERVIEW-GUIDE.md` §5 for the full comparison; the point is that this
   was a choice with a reason, not a default.
 - **`SERIALIZABLE` for every transaction.** Serialisation failures force retries and cost
-  throughput. It is scoped to the booking path, where correctness beats throughput; reads
-  run at `READ COMMITTED`.
+  throughput. The booking path started at Serializable and was moved to `READ COMMITTED`
+  after the load test (explicit locks already give the guarantee). Serializable is kept
+  only where a transaction reads rows it does not lock, such as the payment webhook gate
+  in `payments.service.ts`.
 - **Event sourcing the whole domain.** The ledger is append-only because money genuinely
   needs an audit trail. Making *everything* an event stream would be a large complexity
   bill for one narrow benefit.
-- **GraphQL.** Attractive for a marketplace with varied client needs; rejected because
-  REST + Swagger is faster to build, trivially cacheable at the CDN, and easier to
-  rate-limit per endpoint. Query-cost analysis is a real burden GraphQL adds.
+- **GraphQL for everything.** REST + Swagger stays the API for every write and every
+  authenticated read: faster to build, cacheable, and easy to rate-limit per endpoint.
+  GraphQL was added later only for the public catalog reads, with cost limits and
+  persisted queries ([ADR 0007](https://github.com/jani358/BookLK/blob/main/docs/adr/0007-graphql-for-public-reads.md)).
 - **A service mesh.** Three services do not need mTLS sidecars, traffic shifting, and a
   control plane. That is complexity looking for a problem.
 

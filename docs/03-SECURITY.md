@@ -49,7 +49,8 @@ JWT is untrusted until its signature verifies. A webhook is untrusted until its 
 verifies. A price in a request body is never trusted at all — it is read from the database.
 
 **Explicitly out of scope:** DDoS absorption (a CDN/WAF's job), physical security, host
-OS hardening, supply-chain attacks on npm/Go modules beyond lockfiles and `audit` in CI.
+OS hardening, supply-chain attacks on npm/Go modules beyond committed lockfiles
+(`pnpm install --frozen-lockfile` in CI; there is no `audit` step in CI yet).
 
 ---
 
@@ -410,31 +411,33 @@ retries. Without idempotency, the retry creates a second booking and a second ch
 The refund case is the sharpest. A refund endpoint without idempotency means one
 legitimate cancellation, replayed twenty times, pays out twenty times.
 
-**Implementation:**
+**Implementation:** the key is a UNIQUE column in Postgres on the row it creates
+(`Booking.idempotencyKey`, `Payment.idempotencyKey`, `Refund.idempotencyKey`). There is
+no Redis entry and no TTL.
 
 ```
-Client sends:  Idempotency-Key: <uuid v4, generated once per user intent>
+Client sends:  { ..., "idempotencyKey": "<uuid v4, generated once per user intent>" }  (JSON body)
 
-Server:
-  1. SET idem:<userId>:<key> "IN_PROGRESS" NX EX 86400
-  2. NX failed?
-       value == IN_PROGRESS  → 409 Conflict (request in flight, retry shortly)
-       value == stored resp  → return it verbatim, with the ORIGINAL status code
-  3. NX succeeded → execute, then overwrite the key with the serialised response
-  4. On failure → DELETE the key so a genuine retry can proceed
+Server (POST /api/bookings):
+  1. SELECT the booking WHERE idempotencyKey = key
+  2. Found, same customer   → return that booking (no lock, no new transaction)
+     Found, other customer  → 409 "Idempotency key already used"
+  3. Not found              → normal create path; the INSERT carries the key
+  4. Two first attempts race with one key → only one INSERT can succeed; the other
+     hits the unique index (P2002 → 409)
 ```
 
 Details that matter:
 
-- **The key is scoped by user.** A global namespace lets one user's guessed key collide
-  with another's request.
-- **The key is generated once per user intent**, at the moment the button is rendered —
+- **The key is checked against its owner.** A booking key replayed by another user is
+  rejected, so a guessed key never hands out someone else's booking. A payment key reused
+  for a different booking is rejected too.
+- **The key is generated once per user intent** (held in a `useRef` in the web app) —
   not per HTTP attempt. Regenerating per attempt defeats the entire mechanism.
-- **The stored response is replayed verbatim**, including the status code. Returning `200`
-  where the original returned `201` breaks clients that branch on it.
-- **24-hour TTL.** Long enough to cover any realistic retry, short enough to bound memory.
-- **`IN_PROGRESS` handles concurrent duplicates**, not just sequential retries — two
-  simultaneous submits from a double-clicked button.
+- **Keys never expire.** They live on the row, so a retry days later still finds the
+  original. The cost is one unique index per table.
+- **Concurrent duplicates are handled by the database**, not just sequential retries:
+  two simultaneous submits from a double-clicked button cannot both insert.
 
 Same request + same key = same result, once. That is the invariant.
 
@@ -487,9 +490,10 @@ Same request + same key = same result, once. That is the invariant.
 - Containers run as a non-root user.
 
 ### A06 — Vulnerable and Outdated Components
-- Lockfiles committed; `pnpm audit` and `govulncheck` in CI, failing on high/critical.
-- Dependabot for security patches.
-- Pinned base images (`node:20-alpine`, not `node:latest`).
+- Lockfiles committed and installed with `--frozen-lockfile` in CI.
+- **Not built yet:** `pnpm audit` / `govulncheck` in CI and Dependabot. Run `pnpm audit`
+  and `govulncheck ./...` by hand until they are added.
+- Pinned base image tags (`node:22-alpine`, `node:20-alpine`, `golang:1.23-alpine`, distroless), not `latest`.
 - Honest note: this is only as good as the cadence of actually merging the PRs.
 
 ### A07 — Identification and Authentication Failures
