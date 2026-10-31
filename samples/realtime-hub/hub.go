@@ -1,3 +1,5 @@
+// From apps/realtime/internal/hub/hub.go in github.com/jani358/BookLK.
+
 // Package hub implements the connection registry and fan-out engine.
 //
 // Concurrency model

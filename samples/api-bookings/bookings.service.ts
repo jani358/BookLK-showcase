@@ -1,3 +1,5 @@
+// From apps/api/src/bookings/bookings.service.ts in github.com/jani358/BookLK.
+
 import {
   BadRequestException,
   ConflictException,
@@ -9,7 +11,6 @@ import {
 import {
   Booking,
   BookingStatus,
-  LedgerEntryType,
   PaymentStatus,
   Prisma,
   Role,
@@ -20,6 +21,10 @@ import {
   buildCursorArgs,
   toPaginatedResult,
 } from '../common/dto/pagination.dto';
+import { OutboxService } from '../events/outbox/outbox.service';
+import { FollowUpDispatcher } from '../payments/application/follow-up.dispatcher';
+import { PaymentLifecycleService } from '../payments/application/payment-lifecycle.service';
+import { FollowUp } from '../payments/domain/provider-event';
 import { PrismaService } from '../prisma/prisma.service';
 import { RedisService } from '../redis/redis.service';
 import { CreateBookingDto, ListBookingsQueryDto } from './dto/booking.dto';
@@ -50,6 +55,9 @@ export class BookingsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly redis: RedisService,
+    private readonly outbox: OutboxService,
+    private readonly payments: PaymentLifecycleService,
+    private readonly followUps: FollowUpDispatcher,
   ) {}
 
   /**
@@ -59,10 +67,11 @@ export class BookingsService {
    *
    *   1. Idempotency key   — the same client retrying gets the same booking.
    *   2. Redis SET NX lock — cheap first-line filter. OPTIMISATION ONLY.
-   *   3. SELECT FOR UPDATE inside a Serializable transaction — the REAL
+   *   3. SELECT FOR UPDATE inside a READ COMMITTED transaction — the REAL
    *      guarantee. Concurrent transactions serialise on the slot row.
-   *   4. UNIQUE(slotId) on Booking — the database's own final backstop, which
-   *      holds even if every line of logic above is wrong.
+   *   4. UNIQUE(activeSlotId) on Booking — the database's own final backstop,
+   *      which holds even if every line of logic above is wrong. activeSlotId
+   *      is cleared on cancellation, so a freed slot can be booked again.
    *
    * Layer 2 is explicitly NOT the correctness mechanism. Redis is a separate
    * system that can be down, evict a key, or fail over and lose it; treating a
@@ -88,6 +97,23 @@ export class BookingsService {
         this.logger.log(`Idempotent replay for key ${dto.idempotencyKey}`);
         return existing;
       }
+    }
+
+    // ---- Load shedding: unlocked status read (optimisation) -------------
+    // Under a spike almost every request is a loser. Without this, each loser
+    // that gets the Redis lock after the winner released it opens a full
+    // transaction only to find the slot BOOKED, and those doomed
+    // transactions queue for the Prisma connection pool (k6 spike: p95 5.6 s,
+    // see docs/LOAD-TEST-REPORT.md). A plain read rejects them in one short
+    // query. It can only be wrong in two harmless ways: it says FREE when the
+    // slot was just taken (the FOR UPDATE re-check below catches that), or
+    // BOOKED when it was just freed (a 409 the client can retry).
+    const current = await this.prisma.slot.findUnique({
+      where: { id: dto.slotId },
+      select: { status: true, heldUntil: true },
+    });
+    if (current && !isBookable(current.status, current.heldUntil, new Date())) {
+      throw new ConflictException('Slot no longer available');
     }
 
     // ---- Layer 2: Redis advisory lock (optimisation) -------------------
@@ -147,12 +173,7 @@ export class BookingsService {
         // Re-validated INSIDE the lock. Any check performed before the lock is
         // a stale read by definition.
         const now = new Date();
-        const holdExpired =
-          slot.status === SlotStatus.HELD && slot.heldUntil !== null && slot.heldUntil < now;
-
-        const bookable = slot.status === SlotStatus.FREE || holdExpired;
-
-        if (!bookable) {
+        if (!isBookable(slot.status, slot.heldUntil, now)) {
           throw new ConflictException('Slot no longer available');
         }
 
@@ -177,12 +198,13 @@ export class BookingsService {
           },
         });
 
-        // ---- Layer 4: UNIQUE(slotId) ----------------------------------
+        // ---- Layer 4: UNIQUE(activeSlotId) ----------------------------
         // If a bug ever let two transactions get here, Postgres rejects the
         // second with P2002, which the exception filter maps to a 409.
-        return tx.booking.create({
+        const booking = await tx.booking.create({
           data: {
             slotId: slot.id,
+            activeSlotId: slot.id,
             customerId,
             vendorId: slot.vendorId,
             serviceId: slot.serviceId,
@@ -194,12 +216,35 @@ export class BookingsService {
             idempotencyKey: dto.idempotencyKey,
           },
         });
+
+        // ---- Event: same transaction, never a direct publish ------------
+        // The outbox row commits or rolls back with the booking. A rolled-back
+        // booking therefore never emits booking.created, and a committed one
+        // always does, even if the process dies right after COMMIT.
+        await this.outbox.enqueue(tx, 'booking.created.v1', booking.id, {
+          bookingId: booking.id,
+          slotId: slot.id,
+          vendorId: slot.vendorId,
+          serviceId: slot.serviceId,
+          customerId,
+          status: 'PENDING',
+          priceCents: service.priceCents,
+          slotStartsAt: slot.startsAt.toISOString(),
+          slotStatus: 'BOOKED',
+          // The row is locked FOR UPDATE, so the increment above is exactly +1.
+          slotVersion: slot.version + 1,
+        });
+
+        return booking;
       },
       {
-        // Serializable is the strictest isolation Postgres offers. Combined
-        // with FOR UPDATE it rules out phantom reads as well as lost updates —
-        // for money and inventory, correctness beats throughput.
-        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+        // READ COMMITTED is enough, and Serializable was harmful. Every row
+        // this transaction decides on is locked: the slot by FOR UPDATE above,
+        // and the booking by UNIQUE(activeSlotId). Serializable added predicate
+        // locks on top, and under the k6 spike bookings for DIFFERENT slots
+        // aborted each other (40001 -> P2034 -> 409), which left slots unbooked
+        // and burnt CPU on doomed work (docs/LOAD-TEST-REPORT.md, ADR 0002).
+        isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
         // Fail fast rather than queue behind a long lock; the client can retry.
         timeout: 10_000,
         maxWait: 5_000,
@@ -312,14 +357,30 @@ export class BookingsService {
       throw new BadRequestException('A completed booking cannot be cancelled');
     }
 
-    return this.prisma.$transaction(async (tx) => {
-      const booking = await tx.booking.update({
-        where: { id },
-        data: { status: BookingStatus.CANCELLED, cancelledAt: new Date() },
+    const refundFollowUps: FollowUp[] = [];
+    const cancelled = await this.prisma.$transaction(async (tx) => {
+      // Conditional update: two concurrent cancels both pass the status check
+      // above, but only one of them can flip PENDING/CONFIRMED -> CANCELLED.
+      // The loser becomes a no-op instead of freeing the slot, refunding and
+      // emitting booking.cancelled a second time.
+      const cancelledAt = new Date();
+      const flipped = await tx.booking.updateMany({
+        where: { id, status: { in: [BookingStatus.PENDING, BookingStatus.CONFIRMED] } },
+        // activeSlotId -> NULL releases the UNIQUE claim, so the freed slot can be
+        // booked again while this row stays as history.
+        data: { status: BookingStatus.CANCELLED, cancelledAt, activeSlotId: null },
       });
 
+      if (flipped.count === 0) {
+        const current = await tx.booking.findUnique({ where: { id } });
+        if (current?.status === BookingStatus.CANCELLED) return current;
+        throw new BadRequestException('This booking can no longer be cancelled');
+      }
+
+      const booking = await tx.booking.findUniqueOrThrow({ where: { id } });
+
       // Return the slot to the pool so someone else can book it.
-      await tx.slot.update({
+      const slot = await tx.slot.update({
         where: { id: booking.slotId },
         data: {
           status: SlotStatus.FREE,
@@ -329,32 +390,51 @@ export class BookingsService {
       });
 
       const payment = await tx.payment.findUnique({ where: { bookingId: id } });
+      let refunded = false;
 
-      // Only a SUCCEEDED payment can be refunded. A PENDING intent was never
-      // captured, so there is nothing to give back.
-      if (payment && payment.status === PaymentStatus.SUCCEEDED) {
-        await tx.payment.update({
-          where: { id: payment.id },
-          data: { status: PaymentStatus.REFUNDED },
+      // Only a captured payment can be refunded. A PENDING one was never
+      // charged; if it succeeds later, the payment lifecycle refunds it then.
+      if (
+        payment &&
+        (payment.status === PaymentStatus.SUCCEEDED || payment.status === PaymentStatus.PARTIALLY_REFUNDED) &&
+        payment.refundedCents < payment.amountCents
+      ) {
+        // A Refund ROW, written in this transaction: the decision to refund
+        // commits with the cancellation. The refunds job then executes it at
+        // the provider and appends the ledger reversal when it succeeds. The
+        // key makes a retried cancel return the same refund.
+        const refund = await this.payments.requestRefund(tx, {
+          paymentId: payment.id,
+          reason: 'Booking cancelled',
+          idempotencyKey: `cancel-${id}`,
         });
-
-        // Append a REFUND row rather than deleting the CHARGE: the ledger is
-        // append-only, so the audit trail shows money in AND money out.
-        await tx.ledgerEntry.create({
-          data: {
-            bookingId: id,
-            type: LedgerEntryType.REFUND,
-            // Negative: refunds reduce the platform's net position, so summing
-            // amountCents over the ledger yields the true balance.
-            amountCents: -payment.amountCents,
-          },
-        });
-
-        this.logger.log(`Refund ledger entry created for booking ${id}`);
+        refunded = true;
+        refundFollowUps.push({ kind: 'execute-refund', refundId: refund.id });
+        this.logger.log(`Refund ${refund.id} requested for cancelled booking ${id}`);
       }
+
+      await this.outbox.enqueue(tx, 'booking.cancelled.v1', booking.id, {
+        bookingId: booking.id,
+        slotId: booking.slotId,
+        vendorId: booking.vendorId,
+        serviceId: booking.serviceId,
+        customerId: booking.customerId,
+        status: 'CANCELLED',
+        priceCents: booking.priceCents,
+        slotStartsAt: slot.startsAt.toISOString(),
+        slotStatus: 'FREE',
+        slotVersion: slot.version,
+        cancelledAt: cancelledAt.toISOString(),
+        refunded,
+      });
 
       return booking;
     });
+
+    // After COMMIT: hand the refund to the refunds queue. If this is lost, the
+    // refund sweeper finds the PENDING row.
+    await this.followUps.dispatch(refundFollowUps);
+    return cancelled;
   }
 
   /**
@@ -379,9 +459,42 @@ export class BookingsService {
       throw new BadRequestException('Only a confirmed booking can be completed');
     }
 
-    return this.prisma.booking.update({
-      where: { id },
-      data: { status: BookingStatus.COMPLETED },
+    return this.prisma.$transaction(async (tx) => {
+      // Conditional, so a concurrent cancel cannot be overwritten by a complete.
+      const flipped = await tx.booking.updateMany({
+        where: { id, status: BookingStatus.CONFIRMED },
+        data: { status: BookingStatus.COMPLETED },
+      });
+      if (flipped.count === 0) {
+        throw new BadRequestException('Only a confirmed booking can be completed');
+      }
+
+      const completed = await tx.booking.findUniqueOrThrow({
+        where: { id },
+        include: { slot: { select: { startsAt: true, version: true } } },
+      });
+
+      await this.outbox.enqueue(tx, 'booking.completed.v1', id, {
+        bookingId: id,
+        slotId: completed.slotId,
+        vendorId: completed.vendorId,
+        serviceId: completed.serviceId,
+        customerId: completed.customerId,
+        status: 'COMPLETED',
+        priceCents: completed.priceCents,
+        slotStartsAt: completed.slot.startsAt.toISOString(),
+        slotStatus: 'BOOKED',
+        slotVersion: completed.slot.version,
+      });
+
+      const { slot: _slot, ...plain } = completed;
+      return plain;
     });
   }
+}
+
+/** FREE, or HELD with a hold that has expired. */
+function isBookable(status: SlotStatus, heldUntil: Date | null, now: Date): boolean {
+  if (status === SlotStatus.FREE) return true;
+  return status === SlotStatus.HELD && heldUntil !== null && heldUntil < now;
 }

@@ -1,6 +1,11 @@
+// From apps/api/src/bookings/bookings.service.spec.ts in github.com/jani358/BookLK.
+
 import { ConflictException, NotFoundException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
-import { BookingStatus, SlotStatus } from '@prisma/client';
+import { BookingStatus, PaymentStatus, Prisma, Role, SlotStatus } from '@prisma/client';
+import { OutboxService } from '../events/outbox/outbox.service';
+import { FollowUpDispatcher } from '../payments/application/follow-up.dispatcher';
+import { PaymentLifecycleService } from '../payments/application/payment-lifecycle.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { RedisService } from '../redis/redis.service';
 import { BookingsService } from './bookings.service';
@@ -16,6 +21,9 @@ describe('BookingsService', () => {
   let service: BookingsService;
   let prisma: jest.Mocked<PrismaService>;
   let redis: jest.Mocked<RedisService>;
+  let outbox: { enqueue: jest.Mock };
+  let lifecycle: { requestRefund: jest.Mock };
+  let followUps: { dispatch: jest.Mock };
 
   const CUSTOMER_ID = '11111111-1111-4111-8111-111111111111';
   const SLOT_ID = '22222222-2222-4222-8222-222222222222';
@@ -53,7 +61,12 @@ describe('BookingsService', () => {
     $queryRaw: jest.fn(),
     slot: { update: jest.fn() },
     service: { findUnique: jest.fn().mockResolvedValue(activeService) },
-    booking: { create: jest.fn() },
+    booking: {
+      create: jest.fn(),
+      updateMany: jest.fn(),
+      findUnique: jest.fn(),
+      findUniqueOrThrow: jest.fn(),
+    },
     payment: { findUnique: jest.fn(), update: jest.fn() },
     ledgerEntry: { create: jest.fn() },
     ...overrides,
@@ -67,7 +80,7 @@ describe('BookingsService', () => {
           provide: PrismaService,
           useValue: {
             booking: { findUnique: jest.fn(), findMany: jest.fn(), update: jest.fn() },
-            slot: { update: jest.fn() },
+            slot: { update: jest.fn(), findUnique: jest.fn() },
             payment: { findUnique: jest.fn(), update: jest.fn() },
             ledgerEntry: { create: jest.fn() },
             $transaction: jest.fn(),
@@ -82,12 +95,24 @@ describe('BookingsService', () => {
             releaseLock: jest.fn().mockResolvedValue(true),
           },
         },
+        {
+          provide: OutboxService,
+          useValue: { enqueue: jest.fn().mockResolvedValue(undefined) },
+        },
+        {
+          provide: PaymentLifecycleService,
+          useValue: { requestRefund: jest.fn().mockResolvedValue({ id: 'refund-1' }) },
+        },
+        { provide: FollowUpDispatcher, useValue: { dispatch: jest.fn().mockResolvedValue(undefined) } },
       ],
     }).compile();
 
     service = module.get(BookingsService);
     prisma = module.get(PrismaService);
     redis = module.get(RedisService);
+    outbox = module.get(OutboxService);
+    lifecycle = module.get(PaymentLifecycleService);
+    followUps = module.get(FollowUpDispatcher);
   });
 
   afterEach(() => jest.clearAllMocks());
@@ -170,6 +195,8 @@ describe('BookingsService', () => {
       expect(tx.booking.create).toHaveBeenCalledWith({
         data: expect.objectContaining({
           slotId: SLOT_ID,
+          // The ACTIVE booking holds the slot through this UNIQUE column.
+          activeSlotId: SLOT_ID,
           customerId: CUSTOMER_ID,
           status: BookingStatus.PENDING,
           // Copied from the service at booking time, not referenced later.
@@ -206,6 +233,60 @@ describe('BookingsService', () => {
       const sql = (tx.$queryRaw.mock.calls[0][0] as string[]).join('');
       expect(sql).toContain('FOR UPDATE');
       expect(sql).toContain('"Slot"');
+    });
+
+    it('runs at READ COMMITTED: the row lock and UNIQUE(activeSlotId) are the guarantee', async () => {
+      // Serializable made bookings for DIFFERENT slots abort each other
+      // (40001 / P2034) under the k6 spike, leaving slots unbooked.
+      const tx = mockTx();
+      tx.$queryRaw.mockResolvedValue([futureSlot(SlotStatus.FREE)]);
+      tx.booking.create.mockResolvedValue({ id: 'booking-1' });
+      (prisma.$transaction as jest.Mock).mockImplementation(
+        async (cb: (t: unknown) => Promise<unknown>) => cb(tx),
+      );
+
+      await service.create(CUSTOMER_ID, { slotId: SLOT_ID });
+
+      const options = (prisma.$transaction as jest.Mock).mock.calls[0][1];
+      expect(options.isolationLevel).toBe(Prisma.TransactionIsolationLevel.ReadCommitted);
+    });
+  });
+
+  describe('create - unlocked pre-check (load shedding)', () => {
+    it('rejects a slot that is already BOOKED before taking the lock or opening a transaction', async () => {
+      (prisma.slot.findUnique as jest.Mock).mockResolvedValue({ status: SlotStatus.BOOKED, heldUntil: null });
+
+      await expect(service.create(CUSTOMER_ID, { slotId: SLOT_ID })).rejects.toThrow('Slot no longer available');
+
+      // Under a spike most requests are losers; each one must not cost a
+      // pooled database transaction.
+      expect(redis.acquireLock).not.toHaveBeenCalled();
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('rejects a slot whose hold is still live before taking the lock', async () => {
+      (prisma.slot.findUnique as jest.Mock).mockResolvedValue({
+        status: SlotStatus.HELD,
+        heldUntil: new Date(Date.now() + 60_000),
+      });
+
+      await expect(service.create(CUSTOMER_ID, { slotId: SLOT_ID })).rejects.toThrow(ConflictException);
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('still goes through the lock and the locked transaction when the slot looks FREE', async () => {
+      // The unlocked read is only a filter: a FREE answer may be stale, so the
+      // FOR UPDATE re-check inside the transaction stays the guarantee.
+      (prisma.slot.findUnique as jest.Mock).mockResolvedValue({ status: SlotStatus.FREE, heldUntil: null });
+      const tx = mockTx();
+      tx.$queryRaw.mockResolvedValue([futureSlot(SlotStatus.BOOKED)]);
+      (prisma.$transaction as jest.Mock).mockImplementation(
+        async (cb: (t: unknown) => Promise<unknown>) => cb(tx),
+      );
+
+      await expect(service.create(CUSTOMER_ID, { slotId: SLOT_ID })).rejects.toThrow(ConflictException);
+      expect(redis.acquireLock).toHaveBeenCalled();
+      expect(prisma.$transaction).toHaveBeenCalled();
     });
   });
 
@@ -269,6 +350,146 @@ describe('BookingsService', () => {
       await expect(
         service.create(CUSTOMER_ID, { slotId: SLOT_ID, idempotencyKey: 'key-123' }),
       ).rejects.toThrow('Idempotency key already used');
+    });
+  });
+
+  describe('create - transactional outbox', () => {
+    it('writes booking.created.v1 through the SAME transaction client', async () => {
+      const tx = mockTx();
+      tx.$queryRaw.mockResolvedValue([futureSlot(SlotStatus.FREE)]);
+      tx.booking.create.mockResolvedValue({ id: 'booking-1', slotId: SLOT_ID });
+
+      (prisma.$transaction as jest.Mock).mockImplementation(
+        async (cb: (t: unknown) => Promise<unknown>) => cb(tx),
+      );
+
+      await service.create(CUSTOMER_ID, { slotId: SLOT_ID });
+
+      expect(outbox.enqueue).toHaveBeenCalledTimes(1);
+      const [txArg, name, aggregateId, data] = outbox.enqueue.mock.calls[0];
+      // The tx client, not the global prisma client: the event commits or
+      // rolls back with the booking.
+      expect(txArg).toBe(tx);
+      expect(name).toBe('booking.created.v1');
+      expect(aggregateId).toBe('booking-1');
+      expect(data).toEqual(
+        expect.objectContaining({
+          bookingId: 'booking-1',
+          slotId: SLOT_ID,
+          vendorId: VENDOR_ID,
+          customerId: CUSTOMER_ID,
+          status: 'PENDING',
+          slotStatus: 'BOOKED',
+          priceCents: 750_000,
+          // The locked row had version 0; the booking bumps it to 1.
+          slotVersion: 1,
+        }),
+      );
+    });
+
+    it('writes no event when the booking is rejected', async () => {
+      const tx = mockTx();
+      tx.$queryRaw.mockResolvedValue([futureSlot(SlotStatus.BOOKED)]);
+
+      (prisma.$transaction as jest.Mock).mockImplementation(
+        async (cb: (t: unknown) => Promise<unknown>) => cb(tx),
+      );
+
+      await expect(service.create(CUSTOMER_ID, { slotId: SLOT_ID })).rejects.toThrow(
+        ConflictException,
+      );
+      expect(outbox.enqueue).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('cancel - conditional update + outbox', () => {
+    const BOOKING_ID = '55555555-5555-4555-8555-555555555555';
+    const PAYMENT_ID = '66666666-6666-4666-8666-666666666666';
+
+    const bookingRow = (status: BookingStatus) => ({
+      id: BOOKING_ID,
+      slotId: SLOT_ID,
+      customerId: CUSTOMER_ID,
+      vendorId: VENDOR_ID,
+      serviceId: SERVICE_ID,
+      status,
+      priceCents: 750_000,
+      cancelledAt: null,
+      vendor: { ownerId: 'owner', id: VENDOR_ID },
+    });
+
+    beforeEach(() => {
+      (prisma.booking.findUnique as jest.Mock).mockResolvedValue(
+        bookingRow(BookingStatus.CONFIRMED),
+      );
+    });
+
+    it('frees the slot, records a full refund, and queues it after commit', async () => {
+      const tx = mockTx();
+      tx.booking.updateMany.mockResolvedValue({ count: 1 });
+      tx.booking.findUniqueOrThrow.mockResolvedValue(bookingRow(BookingStatus.CANCELLED));
+      tx.slot.update.mockResolvedValue({ ...futureSlot(SlotStatus.FREE), version: 2 });
+      tx.payment.findUnique.mockResolvedValue({
+        id: PAYMENT_ID,
+        status: PaymentStatus.SUCCEEDED,
+        amountCents: 750_000,
+        refundedCents: 0,
+      });
+      tx.payment.update.mockResolvedValue({
+        id: PAYMENT_ID,
+        provider: 'mock',
+        providerRef: 'pi_1',
+        amountCents: 750_000,
+        platformFeeCents: 75_000,
+        vendorAmountCents: 675_000,
+      });
+
+      (prisma.$transaction as jest.Mock).mockImplementation(
+        async (cb: (t: unknown) => Promise<unknown>) => cb(tx),
+      );
+
+      await service.cancel(BOOKING_ID, CUSTOMER_ID, Role.CUSTOMER);
+
+      // Clearing activeSlotId is what lets the freed slot be booked again.
+      expect(tx.booking.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: BookingStatus.CANCELLED, activeSlotId: null }),
+        }),
+      );
+      // No ledger write here: the reversal is appended when the provider
+      // confirms the refund (PaymentLifecycleService.completeRefund).
+      expect(tx.ledgerEntry.create).not.toHaveBeenCalled();
+      expect(lifecycle.requestRefund).toHaveBeenCalledWith(tx, {
+        paymentId: PAYMENT_ID,
+        reason: 'Booking cancelled',
+        idempotencyKey: 'cancel-' + BOOKING_ID,
+      });
+      expect(followUps.dispatch).toHaveBeenCalledWith([{ kind: 'execute-refund', refundId: 'refund-1' }]);
+      const names = outbox.enqueue.mock.calls.map((c) => c[1]);
+      expect(names).toEqual(['booking.cancelled.v1']);
+      expect(outbox.enqueue.mock.calls[0][3]).toEqual(
+        expect.objectContaining({ slotStatus: 'FREE', slotVersion: 2, refunded: true }),
+      );
+      for (const call of outbox.enqueue.mock.calls) expect(call[0]).toBe(tx);
+    });
+
+    it('is a no-op for the loser of two concurrent cancels (no double refund, no second event)', async () => {
+      const tx = mockTx();
+      // The other cancel already flipped the status.
+      tx.booking.updateMany.mockResolvedValue({ count: 0 });
+      tx.booking.findUnique.mockResolvedValue(bookingRow(BookingStatus.CANCELLED));
+
+      (prisma.$transaction as jest.Mock).mockImplementation(
+        async (cb: (t: unknown) => Promise<unknown>) => cb(tx),
+      );
+
+      const result = await service.cancel(BOOKING_ID, CUSTOMER_ID, Role.CUSTOMER);
+
+      expect(result.status).toBe(BookingStatus.CANCELLED);
+      expect(tx.slot.update).not.toHaveBeenCalled();
+      expect(tx.ledgerEntry.create).not.toHaveBeenCalled();
+      expect(lifecycle.requestRefund).not.toHaveBeenCalled();
+      expect(outbox.enqueue).not.toHaveBeenCalled();
     });
   });
 });

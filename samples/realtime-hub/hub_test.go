@@ -1,3 +1,5 @@
+// From apps/realtime/internal/hub/hub_test.go in github.com/jani358/BookLK.
+
 package hub
 
 import (
